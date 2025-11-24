@@ -92,6 +92,30 @@ class YTDownloader:
 
         return video_urls
 
+    def scrape_playlist_videos(self, playlist_url):
+        """Scrape all video URLs from a YouTube playlist using yt-dlp."""
+        print(f"[*] Scraping videos from playlist: {playlist_url}")
+        video_urls = []
+        try:
+            command = ["yt-dlp", "--print", "id", "--flat-playlist", playlist_url]
+            result = subprocess.run(
+                command, capture_output=True, text=True, check=True, timeout=60
+            )
+            video_ids = result.stdout.strip().split("\n")
+            video_urls = [
+                f"https://www.youtube.com/watch?v={vid_id}"
+                for vid_id in video_ids
+                if vid_id
+            ]
+            print(f"[+] Found {len(video_urls)} videos in playlist.")
+        except subprocess.CalledProcessError as e:
+            print(f"[-] Error scraping playlist: {e.stderr}")
+        except subprocess.TimeoutExpired:
+            print("[-] Playlist scraping timed out.")
+        except Exception as e:
+            print(f"[-] An unexpected error occurred: {e}")
+        return video_urls
+
     def add_videos_to_db(self, video_urls, channel_url):
         """Add scraped video URLs to database"""
         conn = sqlite3.connect(self.db_path)
@@ -122,11 +146,19 @@ class YTDownloader:
         match = re.search(r"v=([a-zA-Z0-9_-]{11})", url)
         return match.group(1) if match else None
 
-    def get_pending_videos(self):
-        """Get all pending videos from database"""
+    def get_pending_videos(self, channel_url=None):
+        """Get all pending videos from database, optionally filtered by channel/playlist URL"""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        c.execute("SELECT id, video_url, video_id FROM videos WHERE status='pending'")
+        if channel_url:
+            c.execute(
+                "SELECT id, video_url, video_id FROM videos WHERE status='pending' AND channel_url=?",
+                (channel_url,),
+            )
+        else:
+            c.execute(
+                "SELECT id, video_url, video_id FROM videos WHERE status='pending'"
+            )
         videos = c.fetchall()
         conn.close()
         return videos
@@ -257,15 +289,28 @@ class YTDownloader:
         conn.commit()
         conn.close()
 
-    def download_all_pending(self, use_title=True, interactive=False):
-        """Download all pending videos"""
-        videos = self.get_pending_videos()
+    def download_all_pending(
+        self,
+        use_title=True,
+        interactive=False,
+        channel_url=None,
+        skip_confirmation=False,
+    ):
+        """Download all pending videos, optionally filtered by channel/playlist URL"""
+        videos = self.get_pending_videos(channel_url=channel_url)
 
         if not videos:
             print("[!] No pending videos to download")
             return
 
         print(f"[*] Found {len(videos)} pending videos")
+
+        if not skip_confirmation:
+            print(f"[*] You are about to download {len(videos)} videos.")
+            choice = input("Do you want to proceed? [y/N]: ").lower()
+            if choice != "y":
+                print("[-] Download aborted.")
+                return
 
         for idx, (db_id, url, vid_id) in enumerate(videos, 1):
             print(f"\n[{idx}/{len(videos)}] Processing: {url}")
@@ -324,12 +369,48 @@ class YTDownloader:
                 f"{vid_id:<5} {status:<12} {title_display:<50} {url[:37] + '...' if len(url) > 40 else url:<40}"
             )
 
+    def delete_videos(self, status, skip_confirmation=False):
+        """Delete videos from database by status"""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+
+        if status == "all":
+            c.execute("SELECT COUNT(*) FROM videos")
+        else:
+            c.execute("SELECT COUNT(*) FROM videos WHERE status=?", (status,))
+        
+        count = c.fetchone()[0]
+
+        if count == 0:
+            print(f"[!] No videos found with status '{status}'")
+            conn.close()
+            return
+
+        if not skip_confirmation:
+            print(f"[*] You are about to DELETE {count} videos with status '{status}'.")
+            choice = input("Are you sure? This cannot be undone. [y/N]: ").lower()
+            if choice != "y":
+                print("[-] Deletion aborted.")
+                conn.close()
+                return
+
+        if status == "all":
+            c.execute("DELETE FROM videos")
+        else:
+            c.execute("DELETE FROM videos WHERE status=?", (status,))
+        
+        conn.commit()
+        conn.close()
+        print(f"[+] Successfully deleted {count} videos.")
+
 
 def main():
     parser = argparse.ArgumentParser(
         description="YouTube Channel Bulk Video Downloader"
     )
     parser.add_argument("--channel", "-c", help="YouTube channel URL")
+    parser.add_argument("--video", "-v", help="Single YouTube video URL to download")
+    parser.add_argument("--playlist", "-p", help="YouTube playlist URL to download")
     parser.add_argument(
         "--scrape", action="store_true", help="Scrape videos from channel"
     )
@@ -343,6 +424,11 @@ def main():
         help="List videos by status",
     )
     parser.add_argument(
+        "--delete",
+        choices=["all", "pending", "completed", "failed"],
+        help="Delete videos by status",
+    )
+    parser.add_argument(
         "--interactive",
         "-i",
         action="store_true",
@@ -352,6 +438,12 @@ def main():
         "--use-id",
         action="store_true",
         help="Use video ID as filename instead of title",
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="Skip confirmation prompt",
     )
     parser.add_argument(
         "--db",
@@ -377,17 +469,56 @@ def main():
         urls = downloader.scrape_channel_videos(args.channel)
         downloader.add_videos_to_db(urls, args.channel)
 
+    if args.video:
+        video_url = args.video
+        video_id = downloader._extract_video_id(video_url)
+        if video_id:
+            downloader.add_videos_to_db([video_url], "Single Video")
+            use_title = not args.use_id
+            custom_name = None
+            if args.interactive:
+                choice = input("Use video title as filename? (y/n/custom): ").lower()
+                if choice == "n":
+                    use_title = False
+                elif choice == "custom":
+                    custom_name = input("Enter custom filename (without extension): ")
+            downloader.download_video(video_id, video_url, custom_name, use_title)
+        else:
+            print(f"[-] Invalid YouTube video URL: {args.video}")
+            sys.exit(1)
+
+    if args.playlist:
+        playlist_url = args.playlist
+        urls = downloader.scrape_playlist_videos(playlist_url)
+        if urls:
+            downloader.add_videos_to_db(urls, playlist_url)
+            print(
+                f"[*] Starting download for {len(urls)} videos from playlist: {playlist_url}"
+            )
+            use_title = not args.use_id
+            downloader.download_all_pending(
+                use_title=use_title,
+                interactive=args.interactive,
+                channel_url=playlist_url,
+                skip_confirmation=args.yes,
+            )
+
     if args.download:
         use_title = not args.use_id
         downloader.download_all_pending(
-            use_title=use_title, interactive=args.interactive
+            use_title=use_title,
+            interactive=args.interactive,
+            skip_confirmation=args.yes,
         )
 
     if args.list:
         status = None if args.list == "all" else args.list
         downloader.list_videos(status=status)
 
-    if not any([args.scrape, args.download, args.list]):
+    if args.delete:
+        downloader.delete_videos(args.delete, skip_confirmation=args.yes)
+
+    if not any([args.scrape, args.download, args.list, args.video, args.playlist, args.delete]):
         parser.print_help()
 
 
